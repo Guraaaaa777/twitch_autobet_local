@@ -31,10 +31,15 @@
         <input type="text" id="test-login" class="mono" placeholder="shroud" style="width:220px">
         <button id="btn-test-twitch">Twitch を検証</button>
         <button id="btn-test-llama">llama.cpp 設定を検証</button>
+        <button id="btn-test-search">ウェブ検索を検証</button>
       </div>
       <div class="small muted" style="margin-top:8px">
         Twitch の非公開 API はスキーマが予告なく変わります。追跡が動かないときはまずここで、
         どのクエリが失敗しているかを確認してください。
+      </div>
+      <div class="small muted" style="margin-top:4px">
+        ウェブ検索の検証は SearXNG に実際に 1 回問い合わせます。検索が無効でも実行できるので、
+        有効にする前の確認に使えます。
       </div>
       <pre class="result" id="test-result" style="display:none"></pre>
     </div>

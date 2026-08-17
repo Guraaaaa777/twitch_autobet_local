@@ -91,18 +91,20 @@ const SECTIONS = [
     fields: [
       { path: 'search.enabled', label: '検索を使う', type: 'checkbox',
         hint: 'ゲーム名・配信タイトル・予想内容から検索し、結果を推論の材料に加えます' },
-      { path: 'search.api_key', label: 'Brave Search API キー', type: 'password',
-        hint: 'https://brave.com/search/api/ で取得します' },
+      { path: 'search.base_url', label: 'SearXNG の URL', type: 'text',
+        hint: '自前で建てた SearXNG のベース URL。例: http://127.0.0.1:8888。'
+            + 'settings.yml で search.formats に json を足し、server.limiter を false にしてください' },
       { path: 'search.query_transcript_chars', label: 'クエリ生成に渡す文字数',
         type: 'number', min: 0,
         hint: '直近の文字起こしをこの文字数までクエリ生成に渡します' },
-      { path: 'search.count', label: '取得件数', type: 'number', min: 1, max: 20 },
+      { path: 'search.count', label: '取得件数', type: 'number', min: 1, max: 20,
+        hint: '上位からこの件数だけを推論に渡します' },
       { path: 'search.max_chars', label: 'プロンプトに渡す文字数', type: 'number', min: 0,
         hint: 'コンテキスト長を消費します。3000 字以上にするならコンテキスト長も見直してください' },
       { path: 'search.timeout_sec', label: 'タイムアウト (秒)', type: 'number', min: 1,
         hint: '超えたら検索を諦めて推論に進みます' },
-      { path: 'search.country', label: '国コード', type: 'text' },
-      { path: 'search.lang', label: '言語コード', type: 'text' },
+      { path: 'search.language', label: '言語コード', type: 'text',
+        hint: 'ja / ja-JP / en など。all なら言語で絞りません' },
     ],
   },
   {
@@ -143,6 +145,7 @@ document.getElementById('btn-save').addEventListener('click', save);
 document.getElementById('btn-reload').addEventListener('click', () => load(true));
 document.getElementById('btn-test-twitch').addEventListener('click', testTwitch);
 document.getElementById('btn-test-llama').addEventListener('click', testLlama);
+document.getElementById('btn-test-search').addEventListener('click', testSearch);
 
 await load(false);
 
@@ -290,6 +293,34 @@ async function testTwitch() {
     showResult(result);
     toast(result.ok ? 'Twitch 接続テスト成功' : '一部のクエリが失敗しました',
       result.ok ? 'ok' : 'err');
+  } catch (err) {
+    toastError(err);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function testSearch() {
+  // The probe runs server-side against the saved settings, so a URL typed but
+  // not saved would be tested as whatever it used to be -- confusing precisely
+  // when you are trying to get the URL right.
+  if (JSON.stringify(collect().search) !== JSON.stringify(current.search)) {
+    toast('ウェブ検索の設定が未保存です。保存してから検証してください', 'err');
+    return;
+  }
+  const button = document.getElementById('btn-test-search');
+  button.disabled = true;
+  try {
+    const result = await post('/api/settings/test/search');
+    showResult(result);
+    if (result.ok) {
+      toast(result.enabled
+        ? `SearXNG に接続できました (${result.results} 件)`
+        : `SearXNG に接続できました (${result.results} 件)。検索はまだ無効です`,
+        result.enabled ? 'ok' : 'err');
+    } else {
+      toast(result.problems.join(' / '), 'err');
+    }
   } catch (err) {
     toastError(err);
   } finally {

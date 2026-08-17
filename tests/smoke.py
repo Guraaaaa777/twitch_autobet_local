@@ -427,8 +427,8 @@ async def test_search() -> None:
     check("文字数上限で結果を切る", len(_clip([long_hit] * 10, 500)) == 2,
           str(len(_clip([long_hit] * 10, 500))))
 
-    config.update({"search": {"enabled": True, "api_key": "dummy", "count": 3,
-                              "max_chars": 1500}})
+    config.update({"search": {"enabled": True, "base_url": "http://127.0.0.1:8888",
+                              "count": 3, "max_chars": 1500}})
     StubLlamaClient.calls = 0
     StubLlamaClient.delay = 0.0
     tracker_mod.LlamaClient = StubLlamaClient  # type: ignore[misc]
@@ -631,6 +631,18 @@ def test_api() -> None:
 
         res = client.get("/api/status")
         check("状態を取得できる", res.status_code == 200 and res.json()["running"] is False)
+
+        # The probe must name the problem rather than raise: an unset URL is the
+        # state every new install starts in. (Reaching a live SearXNG is not
+        # something a test can assume, so only this branch is exercised here.)
+        saved = config.load().search.base_url
+        config.update({"search": {"base_url": ""}})
+        res = client.post("/api/settings/test/search")
+        body = res.json()
+        check("検索の接続テストは URL 未設定を指摘する",
+              res.status_code == 200 and body["ok"] is False
+              and any("未設定" in p for p in body["problems"]), res.text[:200])
+        config.update({"search": {"base_url": saved}})
 
         res = client.post("/api/tracking/start")
         check("認証未設定では追跡を開始できない", res.status_code == 400, res.text[:200])

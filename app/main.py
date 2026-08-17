@@ -9,12 +9,13 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config, db, log, store
 from .paths import WEB_DIR, ensure_dirs
+from .search.client import probe as probe_search
 from .tracker import tracker
 from .twitch.gql import TwitchError
 
@@ -265,6 +266,18 @@ async def test_llama() -> dict[str, Any]:
     }
 
 
+@app.post("/api/settings/test/search")
+async def test_search() -> dict[str, Any]:
+    result = await probe_search(config.load().search)
+    log.write(
+        log.CAT_SYSTEM,
+        f"ウェブ検索 接続テスト: {'成功' if result['ok'] else '失敗'}",
+        level="INFO" if result["ok"] else "WARN",
+        detail=result,
+    )
+    return result
+
+
 # -- logs ------------------------------------------------------------------
 
 
@@ -317,14 +330,29 @@ async def stream() -> StreamingResponse:
 # -- static UI -------------------------------------------------------------
 
 
+# The pages and the ES modules that drive them are edited as a pair: a browser
+# holding a cached half renders a page whose script cannot find the elements it
+# expects, and the screen comes up blank with only a console error. `no-cache`
+# does not forbid caching, it forbids reusing without asking -- the ETag still
+# turns the ask into a 304 for everything that has not changed.
+_NO_CACHE = {"Cache-Control": "no-cache"}
+
+
+class _RevalidatedStatic(StaticFiles):
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+    return FileResponse(WEB_DIR / "index.html", headers=_NO_CACHE)
 
 
 @app.get("/settings")
 async def settings_page() -> FileResponse:
-    return FileResponse(WEB_DIR / "settings.html")
+    return FileResponse(WEB_DIR / "settings.html", headers=_NO_CACHE)
 
 
-app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+app.mount("/static", _RevalidatedStatic(directory=WEB_DIR), name="static")

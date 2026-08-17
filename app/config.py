@@ -125,16 +125,17 @@ class SearchSettings(BaseModel):
     """
 
     enabled: bool = False
-    """Off by default: needs an API key, and the app works without it."""
+    """Off by default: needs a SearXNG instance, and the app works without it."""
 
-    api_key: str = ""
-    """Brave Search API key (X-Subscription-Token)."""
+    base_url: str = "http://127.0.0.1:8888"
+    """Base URL of the self-hosted SearXNG. `/search` is appended."""
 
     query_transcript_chars: int = Field(default=1500, ge=0, le=20_000)
     """Transcript tail handed to that first call. Kept short: it is overhead."""
 
     count: int = Field(default=5, ge=1, le=20)
-    """How many results to request."""
+    """How many results to keep. SearXNG has no count parameter -- it returns
+    whatever its engines agreed on -- so the trimming happens on our side."""
 
     max_chars: int = Field(default=1500, ge=0, le=20_000)
     """Characters of search text handed to the model. Counts against ctx_size."""
@@ -142,8 +143,8 @@ class SearchSettings(BaseModel):
     timeout_sec: float = Field(default=6.0, ge=1.0, le=60.0)
     """A slow search must not eat the inference window; give up and proceed."""
 
-    country: str = "JP"
-    lang: str = "ja"
+    language: str = "ja"
+    """SearXNG `language`: "ja", "ja-JP", or "all" to not filter at all."""
 
 
 class BettingSettings(BaseModel):

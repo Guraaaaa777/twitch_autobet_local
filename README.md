@@ -65,9 +65,35 @@ ffmpeg は PATH 上にあれば自動で使われます。llama-server と GGUF 
 | llama-server 実行ファイル | `llama-server.exe` の絶対パス |
 | モデル (GGUF) | GGUF ファイルの絶対パス |
 
-ウェブ検索は任意です。`設定 → ウェブ検索` を有効にして
-[Brave Search API](https://brave.com/search/api/) のキーを入れると、ゲーム名・配信タイトル・
-予想内容から検索した結果が推論の材料に加わります。無効のままでも動作します。
+ウェブ検索は任意です。有効にすると、ゲーム名・配信タイトル・予想内容から検索した結果が
+推論の材料に加わります。無効のままでも動作します。
+
+検索先は自前で建てた [SearXNG](https://github.com/searxng/searxng) です。API キーも従量課金もなく、
+llama-server と同じくローカルで完結します。Docker でコンテナを 1 つ立てるだけです。
+
+```bash
+docker run -d --name searxng --restart unless-stopped -p 8888:8080 -v "${PWD}/searxng:/etc/searxng" searxng/searxng
+```
+
+このコマンドを打つのは 1 回だけです。`--restart unless-stopped` があるので、以降は Docker Desktop の
+起動に合わせて SearXNG も自動で立ち上がります。本アプリが起動することはないので、コンテナを
+自分で止めた場合は `docker start searxng` で戻してください (止まったままでも、検索を諦めて
+推論に進むだけで追跡は動きます)。
+
+初回起動で `searxng/settings.yml` が生成されるので、次の 2 か所を直してコンテナを再起動します。
+SearXNG は既定で JSON を返さず、さらにブラウザ以外からのアクセスを弾くため、どちらも入れないと
+403 になります。
+
+```yaml
+search:
+  formats:
+    - html
+    - json
+server:
+  limiter: false
+```
+
+あとは `設定 → ウェブ検索` を有効にし、URL に `http://127.0.0.1:8888` を入れます。
 
 `auth-token` はブラウザの DevTools → Application → Cookies → `https://www.twitch.tv` から取得します。
 **このトークンはアカウントそのものへのアクセス権を持ちます。** `data/settings.json` に平文で保存されるので、
@@ -160,7 +186,7 @@ app/
     server.py              llama-server プロセス管理
     client.py              /v1/chat/completions クライアントと応答解釈
     prompt.py              プロンプト構築
-  search/client.py         Brave Search クライアントとクエリ組み立て
+  search/client.py         SearXNG クライアントとクエリ組み立て
   betting/kelly.py         パリミュチュアル対応ケリー基準
   transcribe/worker.py     streamlink → ffmpeg → faster-whisper
 web/                       UI (素の HTML / CSS / ES modules、外部依存なし)
