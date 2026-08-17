@@ -27,8 +27,13 @@ class LlamaSettings(BaseModel):
     model_path: str = ""
     """Absolute path to the GGUF model."""
 
-    ctx_size: int = Field(default=8192, ge=512, le=1_048_576)
-    """--ctx-size. Must be large enough for the transcript window."""
+    ctx_size: int = Field(default=16384, ge=512, le=1_048_576)
+    """--ctx-size. Must cover the whole prompt, not just the transcript:
+    `transcription.prompt_chars` + `history_limit` past predictions +
+    `search.max_chars` + `max_tokens` of output. With the defaults that tops
+    out near 13,300 characters -- ~13,700 tokens at the pessimistic
+    one-token-per-character rate -- so 8192 dropped exactly the predictions
+    with many outcomes, where the history section triples in size."""
 
     n_gpu_layers: int = Field(default=0, ge=0, le=999)
     """--n-gpu-layers ("総数"). 0 = pure CPU."""
@@ -107,6 +112,40 @@ class TranscriptionSettings(BaseModel):
     """Transcript characters handed to the LLM (most recent wins)."""
 
 
+class SearchSettings(BaseModel):
+    """Web search that enriches the inference prompt.
+
+    The model writes the query and we run it. A query cannot be assembled
+    mechanically: 「優勝 / する / しない」 identifies nothing, and the game is
+    often named only in the transcript. But the model does not get to *call*
+    the search either -- tool calling would make inference a multi-turn
+    exchange with two different output formats, and a malformed turn costs the
+    whole prediction. So it is two plain constrained calls: what to search,
+    then what to think.
+    """
+
+    enabled: bool = False
+    """Off by default: needs an API key, and the app works without it."""
+
+    api_key: str = ""
+    """Brave Search API key (X-Subscription-Token)."""
+
+    query_transcript_chars: int = Field(default=1500, ge=0, le=20_000)
+    """Transcript tail handed to that first call. Kept short: it is overhead."""
+
+    count: int = Field(default=5, ge=1, le=20)
+    """How many results to request."""
+
+    max_chars: int = Field(default=1500, ge=0, le=20_000)
+    """Characters of search text handed to the model. Counts against ctx_size."""
+
+    timeout_sec: float = Field(default=6.0, ge=1.0, le=60.0)
+    """A slow search must not eat the inference window; give up and proceed."""
+
+    country: str = "JP"
+    lang: str = "ja"
+
+
 class BettingSettings(BaseModel):
     dry_run: bool = True
     """When true, everything runs except the MakePrediction mutation."""
@@ -135,6 +174,7 @@ class Settings(BaseModel):
     llama: LlamaSettings = Field(default_factory=LlamaSettings)
     twitch: TwitchSettings = Field(default_factory=TwitchSettings)
     transcription: TranscriptionSettings = Field(default_factory=TranscriptionSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
     betting: BettingSettings = Field(default_factory=BettingSettings)
 
     poll_rate_sec: float = Field(default=5.0, ge=1.0, le=300.0)

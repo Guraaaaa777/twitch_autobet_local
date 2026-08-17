@@ -7,10 +7,18 @@ One `Tracker` owns everything that runs while tracking is on:
 * a single PubSub socket that pushes prediction events the instant they happen,
   so a 60-second window is not half over before we notice it;
 * the llama-server process and the transcription workers;
+* one inference task per open prediction, started the moment it is detected;
 * one timer per open prediction that fires `bet_lead_sec` before it locks.
 
+Inference and betting are deliberately split. What the model estimates is which
+outcome happens, which does not depend on the pool, so it runs at detection and
+gets the whole window to finish. What needs a fresh pool is the Kelly sizing,
+and that is arithmetic. Doing it the other way round -- model first, inside the
+lead window -- would force `bet_lead_sec` up to 30-45 seconds on any model worth
+running locally, and by then the pool is too young to be worth re-reading.
+
 Both event sources funnel into `_observe()`, so it is written to be idempotent:
-the same event arriving twice must not produce two bets.
+the same event arriving twice must not produce two bets or two inferences.
 """
 
 from __future__ import annotations
@@ -26,9 +34,10 @@ from .betting import OutcomeInput, decide, outcome_metrics
 from .llm.client import LlamaClient, LlamaError
 from .llm.prompt import PromptContext
 from .llm.server import LlamaServer
+from .search import SearchHit, search
 from .transcribe import TranscriptionManager
 from .twitch.gql import TwitchError, TwitchGQLClient
-from .twitch.models import PredictionEvent
+from .twitch.models import PredictionEvent, StreamInfo
 from .twitch.pubsub import PubSubListener
 
 
@@ -66,6 +75,8 @@ class Tracker:
         self._channels: dict[int, ChannelRuntime] = {}
         self._bet_tasks: dict[str, asyncio.Task] = {}
         self._bet_guard: set[str] = set()
+        self._infer_tasks: dict[str, asyncio.Task] = {}
+        self._infer_results: dict[str, tuple[dict[str, float], dict[str, Any]]] = {}
         self._twitch: TwitchGQLClient | None = None
         self._pubsub: PubSubListener | None = None
         self._housekeeping: asyncio.Task | None = None
@@ -190,9 +201,11 @@ class Tracker:
                 return
             self._running = False
 
-            for event_id, task in list(self._bet_tasks.items()):
-                task.cancel()
-                self._bet_tasks.pop(event_id, None)
+            for tasks in (self._bet_tasks, self._infer_tasks):
+                for event_id, task in list(tasks.items()):
+                    task.cancel()
+                    tasks.pop(event_id, None)
+            self._infer_results.clear()
             for rt in self._channels.values():
                 if rt.task is not None:
                     rt.task.cancel()
@@ -338,19 +351,196 @@ class Tracker:
 
         if event.is_open:
             rt.active_event_id = event.event_id
+            self._schedule_inference(rt, event, prediction_id)
             self._schedule_bet(rt, event, prediction_id)
         else:
             if rt.active_event_id == event.event_id:
                 rt.active_event_id = None
                 rt.next_bet_at = None
-            task = self._bet_tasks.pop(event.event_id, None)
-            if task is not None and not task.done():
-                task.cancel()
+            for tasks in (self._bet_tasks, self._infer_tasks):
+                task = tasks.pop(event.event_id, None)
+                if task is not None and not task.done():
+                    task.cancel()
+            self._infer_results.pop(event.event_id, None)
 
         # Settle once, on the transition into a final state. `settle_bets` is
         # idempotent, but `_settle` also logs and samples points, which is not.
         if event.is_final and previous_status != event.status:
             await self._settle(rt, event, prediction_id)
+
+    def _schedule_inference(
+        self, rt: ChannelRuntime, event: PredictionEvent, prediction_id: int
+    ) -> None:
+        """Start estimating probabilities as soon as the prediction is seen."""
+        event_id = event.event_id
+        if event_id in self._infer_tasks or event_id in self._infer_results:
+            return
+        channel = store.get_channel(rt.channel_id)
+        if channel is None:
+            return
+
+        if _fixed_probs_enabled(channel):
+            if _fixed_probs_usable(channel, event):
+                return  # resolved at bet time; no model involved
+            log.warn(
+                log.CAT_INFERENCE,
+                f"固定確率の項目数 ({len(channel['fixed_probs'].get('probs') or [])}) が"
+                f"選択肢数 ({len(event.outcomes)}) と一致しないため LLM 推論に切り替えます",
+                channel=rt.login,
+                detail={"event_id": event_id},
+            )
+
+        if not self.llama.running:
+            log.error(
+                "llama-server が起動していないため推論できません",
+                channel=rt.login, category=log.CAT_INFERENCE,
+                detail={"event_id": event_id},
+            )
+            return
+
+        self._infer_tasks[event_id] = asyncio.create_task(
+            self._run_inference(rt, event, prediction_id),
+            name=f"infer-{event_id[:8]}",
+        )
+
+    async def _enrich(
+        self,
+        rt: ChannelRuntime,
+        event: PredictionEvent,
+        settings: Any,
+        channel: dict,
+        transcript: str,
+    ) -> tuple[StreamInfo, list[SearchHit]]:
+        """Stream context and web search for the prompt.
+
+        Both are enrichments: a failure here costs the model some context but
+        must never cost us the prediction, so everything is swallowed.
+        """
+        stream = StreamInfo()
+        try:
+            stream = await self.client().fetch_stream_info(rt.login)
+        except Exception as exc:  # noqa: BLE001
+            log.warn(
+                log.CAT_INFERENCE,
+                f"配信情報を取得できませんでした ({type(exc).__name__})",
+                channel=rt.login,
+                detail={"event_id": event.event_id},
+            )
+
+        if not settings.search.enabled:
+            return stream, []
+
+        ctx = PromptContext(
+            channel_login=rt.login,
+            channel_display=rt.display_name,
+            event=event,
+            manual_info=str(channel.get("manual_info") or ""),
+            transcript=transcript,
+            stream_title=stream.title,
+            game_name=stream.game,
+        )
+        client = LlamaClient(settings.llama, self.llama.base_url)
+        try:
+            suggestion = await client.suggest_query(
+                ctx, settings.search.query_transcript_chars
+            )
+        except LlamaError as exc:
+            log.warn(
+                log.CAT_INFERENCE,
+                f"検索クエリの生成に失敗しました: {exc} — 検索なしで推論します",
+                channel=rt.login,
+                detail={"event_id": event.event_id},
+            )
+            return stream, []
+
+        if not suggestion.query:
+            # The model was told to answer empty rather than guess. Searching a
+            # topic it could not identify would only feed the prompt noise.
+            log.info(
+                log.CAT_INFERENCE,
+                "話題を特定できなかったため検索を省略します",
+                channel=rt.login,
+                detail={"event_id": event.event_id, "topic": suggestion.topic},
+            )
+            return stream, []
+
+        hits = await search(suggestion.query, settings.search)
+        log.info(
+            log.CAT_INFERENCE,
+            f"検索しました: {len(hits)} 件 — {suggestion.topic}",
+            channel=rt.login,
+            detail={"event_id": event.event_id, "query": suggestion.query,
+                    "topic": suggestion.topic,
+                    "latency_ms": suggestion.latency_ms,
+                    "results": [{"title": h.title, "url": h.url} for h in hits]},
+        )
+        return stream, hits
+
+    async def _run_inference(
+        self, rt: ChannelRuntime, event: PredictionEvent, prediction_id: int
+    ) -> None:
+        """Task wrapper. Nothing awaits this task until the bet fires, so an
+        escaping exception would otherwise vanish until then."""
+        try:
+            await self._infer(rt, event, prediction_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the task must not die silently
+            log.error("推論処理に失敗しました", channel=rt.login, exc=exc,
+                      detail={"event_id": event.event_id})
+
+    async def _infer(
+        self, rt: ChannelRuntime, event: PredictionEvent, prediction_id: int
+    ) -> None:
+        settings = config.load()
+        channel = store.get_channel(rt.channel_id)
+        if channel is None:
+            return
+        transcript = store.recent_transcript_text(
+            rt.channel_id,
+            settings.transcription.retention_min,
+            settings.transcription.prompt_chars,
+        )
+        stream, hits = await self._enrich(rt, event, settings, channel, transcript)
+        ctx = PromptContext(
+            channel_login=rt.login,
+            channel_display=rt.display_name,
+            event=event,
+            manual_info=str(channel.get("manual_info") or ""),
+            history=store.resolved_history_for_prompt(
+                rt.channel_id, settings.llama.history_limit
+            ),
+            transcript=transcript,
+            seconds_until_lock=event.seconds_until_lock(),
+            stream_title=stream.title,
+            game_name=stream.game,
+            search_results=[
+                {"title": h.title, "description": h.description} for h in hits
+            ],
+        )
+        client = LlamaClient(settings.llama, self.llama.base_url)
+        try:
+            result = await client.infer(ctx)
+        except asyncio.CancelledError:
+            raise
+        except LlamaError as exc:
+            # The task stays in `_infer_tasks` so a failure is not retried on
+            # every poll for the rest of the window.
+            log.error(f"LLM 推論に失敗しました: {exc}", channel=rt.login,
+                      category=log.CAT_INFERENCE,
+                      detail={"event_id": event.event_id})
+            return
+
+        inference = {
+            "rationale": result.rationale,
+            "raw_response": result.raw_response,
+            "latency_ms": result.latency_ms,
+            "warnings": result.warnings,
+        }
+        self._infer_results[event.event_id] = (result.probabilities, inference)
+        self._record_probabilities(
+            rt, event, prediction_id, result.probabilities, "llm", inference
+        )
 
     def _schedule_bet(
         self, rt: ChannelRuntime, event: PredictionEvent, prediction_id: int
@@ -435,34 +625,11 @@ class Tracker:
             rt.balance = balance
         bankroll = int(rt.balance or 0)
 
-        # -- probabilities: fixed setting wins, otherwise ask the model --
-        probs, source, inference = await self._probabilities(rt, channel, event)
+        # -- probabilities: the fixed setting wins, otherwise the estimate made
+        # when the prediction opened. No model call happens here. --
+        probs = self._resolve_probabilities(rt, channel, event, prediction_id)
         if probs is None:
             return
-
-        store.record_inference(
-            prediction_id,
-            source,
-            probs,
-            rationale=inference.get("rationale", ""),
-            raw_response=inference.get("raw_response"),
-            latency_ms=inference.get("latency_ms"),
-        )
-        log.info(
-            log.CAT_INFERENCE,
-            f"推論結果 ({'固定確率' if source == 'fixed' else 'LLM'}): {event.title}",
-            channel=rt.login,
-            detail={
-                "event_id": event_id,
-                "probabilities": [
-                    {"title": o.title, "probability": round(probs.get(o.outcome_id, 0.0), 4)}
-                    for o in event.outcomes
-                ],
-                "rationale": inference.get("rationale", ""),
-                "latency_ms": inference.get("latency_ms"),
-                "warnings": inference.get("warnings", []),
-            },
-        )
 
         # -- stake sizing --
         decision = decide(
@@ -555,66 +722,83 @@ class Tracker:
         # 自動投票後にチャンネルポイントを取得
         await self._sample_points(rt)
 
-    async def _probabilities(
-        self, rt: ChannelRuntime, channel: dict, event: PredictionEvent
-    ) -> tuple[dict[str, float] | None, str, dict[str, Any]]:
-        settings = config.load()
-        fixed = channel.get("fixed_probs")
+    def _resolve_probabilities(
+        self,
+        rt: ChannelRuntime,
+        channel: dict,
+        event: PredictionEvent,
+        prediction_id: int,
+    ) -> dict[str, float] | None:
+        """Probabilities for the bet about to be placed.
 
-        if _fixed_probs_enabled(channel):
-            values = list(fixed.get("probs") or [])
-            if len(values) == len(event.outcomes):
-                total = sum(max(0.0, float(v)) for v in values) or 1.0
-                probs = {
-                    o.outcome_id: max(0.0, float(v)) / total
-                    for o, v in zip(event.outcomes, values, strict=True)
-                }
-                return probs, "fixed", {"rationale": "固定確率設定を使用"}
+        Deliberately synchronous: by the time this runs there are only
+        `bet_lead_sec` seconds left, so anything slow belongs in
+        `_run_inference`, which started when the prediction opened.
+        """
+        if _fixed_probs_usable(channel, event):
+            values = list(channel["fixed_probs"].get("probs") or [])
+            total = sum(max(0.0, float(v)) for v in values) or 1.0
+            probs = {
+                o.outcome_id: max(0.0, float(v)) / total
+                for o, v in zip(event.outcomes, values, strict=True)
+            }
+            self._record_probabilities(
+                rt, event, prediction_id, probs, "fixed",
+                {"rationale": "固定確率設定を使用"},
+            )
+            return probs
+
+        cached = self._infer_results.get(event.event_id)
+        if cached is not None:
+            return cached[0]
+
+        task = self._infer_tasks.get(event.event_id)
+        if task is not None and not task.done():
+            task.cancel()
             log.warn(
                 log.CAT_INFERENCE,
-                f"固定確率の項目数 ({len(values)}) が選択肢数 ({len(event.outcomes)}) と"
-                "一致しないため LLM 推論に切り替えます",
+                "締め切りまでに推論が終わらなかったため投票を見送ります",
                 channel=rt.login,
+                detail={"event_id": event.event_id},
             )
-
-        if not self.llama.running:
+        else:
             log.error(
-                "llama-server が起動していないため推論できません",
+                "推論結果がないため投票できません",
                 channel=rt.login, category=log.CAT_INFERENCE,
+                detail={"event_id": event.event_id},
             )
-            return None, "llm", {}
+        return None
 
-        transcript = store.recent_transcript_text(
-            rt.channel_id,
-            settings.transcription.retention_min,
-            settings.transcription.prompt_chars,
+    def _record_probabilities(
+        self,
+        rt: ChannelRuntime,
+        event: PredictionEvent,
+        prediction_id: int,
+        probs: dict[str, float],
+        source: str,
+        inference: dict[str, Any],
+    ) -> None:
+        store.record_inference(
+            prediction_id,
+            source,
+            probs,
+            rationale=inference.get("rationale", ""),
+            raw_response=inference.get("raw_response"),
+            latency_ms=inference.get("latency_ms"),
         )
-        ctx = PromptContext(
-            channel_login=rt.login,
-            channel_display=rt.display_name,
-            event=event,
-            manual_info=str(channel.get("manual_info") or ""),
-            history=store.resolved_history_for_prompt(
-                rt.channel_id, settings.llama.history_limit
-            ),
-            transcript=transcript,
-            seconds_until_lock=event.seconds_until_lock(),
-        )
-        client = LlamaClient(settings.llama, self.llama.base_url)
-        try:
-            result = await client.infer(ctx)
-        except LlamaError as exc:
-            log.error(f"LLM 推論に失敗しました: {exc}", channel=rt.login,
-                      category=log.CAT_INFERENCE)
-            return None, "llm", {}
-        return (
-            result.probabilities,
-            "llm",
-            {
-                "rationale": result.rationale,
-                "raw_response": result.raw_response,
-                "latency_ms": result.latency_ms,
-                "warnings": result.warnings,
+        log.info(
+            log.CAT_INFERENCE,
+            f"推論結果 ({'固定確率' if source == 'fixed' else 'LLM'}): {event.title}",
+            channel=rt.login,
+            detail={
+                "event_id": event.event_id,
+                "probabilities": [
+                    {"title": o.title, "probability": round(probs.get(o.outcome_id, 0.0), 4)}
+                    for o in event.outcomes
+                ],
+                "rationale": inference.get("rationale", ""),
+                "latency_ms": inference.get("latency_ms"),
+                "warnings": inference.get("warnings", []),
             },
         )
 
@@ -674,6 +858,13 @@ class Tracker:
 def _fixed_probs_enabled(channel: dict) -> bool:
     fixed = channel.get("fixed_probs")
     return bool(isinstance(fixed, dict) and fixed.get("enabled") and fixed.get("probs"))
+
+
+def _fixed_probs_usable(channel: dict, event: PredictionEvent) -> bool:
+    """Fixed probabilities only apply to predictions with a matching outcome count."""
+    if not _fixed_probs_enabled(channel):
+        return False
+    return len(list(channel["fixed_probs"].get("probs") or [])) == len(event.outcomes)
 
 
 def _now_text(offset: float = 0.0) -> str:

@@ -11,7 +11,13 @@ from typing import Any
 import httpx
 
 from ..config import LlamaSettings
-from .prompt import RESPONSE_SCHEMA, PromptContext, build_messages
+from .prompt import (
+    QUERY_SCHEMA,
+    RESPONSE_SCHEMA,
+    PromptContext,
+    build_messages,
+    build_query_messages,
+)
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -30,6 +36,15 @@ class InferenceResult:
     latency_ms: int = 0
     prompt_chars: int = 0
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class QuerySuggestion:
+    """What the model thinks the prediction is about, and what to search for."""
+
+    topic: str = ""
+    query: str = ""
+    latency_ms: int = 0
 
 
 class LlamaClient:
@@ -79,6 +94,37 @@ class LlamaClient:
             latency_ms=latency_ms,
             prompt_chars=prompt_chars,
             warnings=warnings + norm_warnings,
+        )
+
+    async def suggest_query(
+        self, ctx: PromptContext, transcript_chars: int
+    ) -> QuerySuggestion:
+        """Work out what this prediction is about, and what to search for.
+
+        Runs before the real inference: "優勝 する / しない" says nothing on its
+        own, and only the transcript reveals that the game is Apex. A mechanical
+        query built from the title alone cannot find that out.
+        """
+        body: dict[str, Any] = {
+            "messages": build_query_messages(ctx, transcript_chars),
+            "temperature": min(self.settings.temperature, 0.3),
+            "max_tokens": 256,
+            "stream": False,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "search_query", "schema": QUERY_SCHEMA,
+                                "strict": True},
+            },
+        }
+        started = time.perf_counter()
+        text = await self._complete(body)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+
+        data = _loads(text)
+        return QuerySuggestion(
+            topic=str(data.get("topic") or "").strip()[:200],
+            query=str(data.get("query") or "").strip()[:300],
+            latency_ms=latency_ms,
         )
 
     async def _complete(self, body: dict[str, Any]) -> str:

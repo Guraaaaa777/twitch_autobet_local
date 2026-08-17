@@ -54,6 +54,17 @@ class ChannelInfo:
 
 
 @dataclass
+class StreamInfo:
+    """What is being streamed right now, for search queries and prompt context."""
+
+    title: str = ""
+    game: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.title or self.game)
+
+
+@dataclass
 class PredictionOutcome:
     outcome_id: str
     title: str

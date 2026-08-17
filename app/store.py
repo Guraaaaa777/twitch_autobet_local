@@ -218,7 +218,13 @@ def recent_predictions(channel_id: int, limit: int = 30) -> list[dict[str, Any]]
 
 
 def resolved_history_for_prompt(channel_id: int, limit: int) -> list[dict[str, Any]]:
-    """Past resolved predictions, shaped for the LLM prompt."""
+    """Past resolved predictions, shaped for the LLM prompt.
+
+    Which options were offered and which one won -- not how the vote split.
+    Showing the model how the crowd priced past predictions only teaches it to
+    follow the market, and the market's view is already accounted for in the
+    Kelly step, which reads the live pool seconds before the deadline.
+    """
     if limit <= 0:
         return []
     rows = db.query(
@@ -231,12 +237,11 @@ def resolved_history_for_prompt(channel_id: int, limit: int) -> list[dict[str, A
     for row in rows:
         outcomes = db.rows_to_dicts(
             db.query(
-                "SELECT outcome_id, title, total_points FROM prediction_outcomes"
+                "SELECT outcome_id, title FROM prediction_outcomes"
                 " WHERE prediction_id = ? ORDER BY position",
                 (row["id"],),
             )
         )
-        total = sum(max(0, o["total_points"]) for o in outcomes) or 1
         winner = next(
             (o["title"] for o in outcomes if o["outcome_id"] == row["winning_outcome_id"]),
             None,
@@ -245,10 +250,7 @@ def resolved_history_for_prompt(channel_id: int, limit: int) -> list[dict[str, A
             {
                 "title": row["title"],
                 "winner_title": winner,
-                "outcomes": [
-                    {"title": o["title"], "share": max(0, o["total_points"]) / total}
-                    for o in outcomes
-                ],
+                "outcomes": [{"title": o["title"]} for o in outcomes],
             }
         )
     return list(reversed(history))

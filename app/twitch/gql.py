@@ -20,7 +20,7 @@ from typing import Any
 import httpx
 
 from ..config import TwitchSettings
-from .models import ChannelInfo, PredictionEvent
+from .models import ChannelInfo, PredictionEvent, StreamInfo
 
 GQL_URL = "https://gql.twitch.tv/gql"
 
@@ -31,6 +31,22 @@ query AutobetChannel($login: String!) {
     login
     displayName
     stream { id }
+  }
+}
+"""
+
+Q_STREAM = """
+query AutobetStream($login: String!) {
+  user(login: $login) {
+    id
+    broadcastSettings {
+      title
+      game { name }
+    }
+    stream {
+      id
+      game { name }
+    }
   }
 }
 """
@@ -211,6 +227,30 @@ class TwitchGQLClient:
             is_live=bool(user.get("stream")),
         )
 
+    async def fetch_stream_info(self, login: str) -> StreamInfo:
+        """Current stream title and game.
+
+        Only used to build a search query and to give the model something to
+        anchor a vague prediction title on, so it is fetched once per
+        prediction rather than on every poll. `broadcastSettings` answers even
+        when the channel is offline; `stream.game` is preferred when live
+        because the broadcaster may have changed games without editing it.
+        """
+        login = login.strip().lower()
+        results = await self._post(
+            [self._op(Q_STREAM, {"login": login}, "AutobetStream")]
+        )
+        data = self._unwrap(results[0], "配信情報")
+        user = data.get("user") or {}
+        settings = user.get("broadcastSettings") or {}
+        stream = user.get("stream") or {}
+        live_game = (stream.get("game") or {}).get("name")
+        set_game = (settings.get("game") or {}).get("name")
+        return StreamInfo(
+            title=str(settings.get("title") or ""),
+            game=str(live_game or set_game or ""),
+        )
+
     async def fetch_state(
         self, login: str, *, count: int = 1
     ) -> tuple[int | None, list[PredictionEvent], list[TwitchError]]:
@@ -342,7 +382,12 @@ class TwitchGQLClient:
             return {"recent_predictions": len(edges),
                     "titles": [((e or {}).get("node") or {}).get("title") for e in edges[:5]]}
 
+        async def stream_check() -> Any:
+            info = await self.fetch_stream_info(login)
+            return {"title": info.title, "game": info.game}
+
         await run("チャンネル解決", channel_check())
         await run("チャンネルポイント残高", points_check())
         await run("予想イベント取得", predictions_check())
+        await run("配信タイトル / ゲーム", stream_check())
         return checks

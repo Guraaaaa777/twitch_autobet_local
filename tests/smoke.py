@@ -22,11 +22,14 @@ os.environ["TWITCH_AUTOBET_DATA"] = str(_TMP)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import config, db, log, store  # noqa: E402
+from app import tracker as tracker_mod  # noqa: E402
 from app.betting import OutcomeInput, decide  # noqa: E402
-from app.llm.client import _normalise, _parse  # noqa: E402
+from app.llm.client import LlamaError, QuerySuggestion, _normalise, _parse  # noqa: E402
+from app.llm.prompt import _format_history, build_messages  # noqa: E402
+from app.search.client import SearchHit, _clip  # noqa: E402
 from app.tracker import ChannelRuntime, Tracker  # noqa: E402
 from app.twitch.gql import TwitchError  # noqa: E402
-from app.twitch.models import PredictionEvent  # noqa: E402
+from app.twitch.models import PredictionEvent, StreamInfo  # noqa: E402
 
 PASSED: list[str] = []
 
@@ -73,15 +76,70 @@ class StubTwitch:
         self.event = make_event()
         self.placed: list[tuple[str, str, int]] = []
         self.reject: str | None = None
+        self.stream_fails = False
+        self.stream = StreamInfo(title="ランクマ耐久", game="Apex Legends")
 
     async def fetch_state(self, login: str, count: int = 1):
         return self.balance, [PredictionEvent.parse(self.event)], []
+
+    async def fetch_stream_info(self, login: str):
+        if self.stream_fails:
+            raise TwitchError("配信情報の取得に失敗", code="STREAM")
+        return self.stream
 
     async def make_prediction(self, event_id: str, outcome_id: str, points: int) -> None:
         if self.reject:
             raise TwitchError(f"Twitch が投票を拒否しました ({self.reject})", code=self.reject)
         self.placed.append((event_id, outcome_id, points))
         self.balance -= points
+
+
+class StubLlamaServer:
+    """Stands in for LlamaServer: always up, never spawns anything."""
+
+    running = True
+    base_url = "http://stub"
+
+
+class StubResult:
+    def __init__(self, probs: dict[str, float]) -> None:
+        self.probabilities = probs
+        self.rationale = "スタブ推論"
+        self.raw_response = "{}"
+        self.latency_ms = 12
+        self.warnings: list[str] = []
+
+
+class StubLlamaClient:
+    """Stands in for LlamaClient. Class-level state so the test can inspect it."""
+
+    calls = 0
+    probs = {"o1": 0.8, "o2": 0.2}
+    delay = 0.0
+    last_ctx = None
+
+    query_calls = 0
+    last_query_ctx = None
+    suggestion = ("Apex Legends のマッチで優勝できるか", "Apex Legends 優勝 確率 チーム数")
+    query_raises = False
+
+    def __init__(self, settings, base_url: str) -> None:
+        pass
+
+    async def infer(self, ctx):
+        StubLlamaClient.calls += 1
+        StubLlamaClient.last_ctx = ctx
+        if StubLlamaClient.delay:
+            await asyncio.sleep(StubLlamaClient.delay)
+        return StubResult(dict(StubLlamaClient.probs))
+
+    async def suggest_query(self, ctx, transcript_chars: int):
+        StubLlamaClient.query_calls += 1
+        StubLlamaClient.last_query_ctx = ctx
+        if StubLlamaClient.query_raises:
+            raise LlamaError("スタブのクエリ生成失敗")
+        topic, query = StubLlamaClient.suggestion
+        return QuerySuggestion(topic=topic, query=query, latency_ms=5)
 
 
 # -- unit-level checks ------------------------------------------------------
@@ -252,6 +310,264 @@ async def test_flow() -> None:
     check("見送り理由が残る", bool(row["error"]), str(row))
 
 
+async def test_two_phase() -> None:
+    """The model runs at detection; only Kelly sizing runs in the lead window."""
+    print("\n[推論と投票の分離]")
+    log.bind_loop(asyncio.get_running_loop())
+    # A wide cap so the two pools produce genuinely different stakes rather
+    # than both clamping to 最大賭け率.
+    config.update({"betting": {"dry_run": True, "kelly_fraction": 0.25,
+                               "max_bet_ratio": 0.5, "min_edge": 0.05}})
+    StubLlamaClient.calls = 0
+    StubLlamaClient.delay = 0.0
+    tracker_mod.LlamaClient = StubLlamaClient  # type: ignore[misc]
+
+    channel_id = store.create_channel("llmstreamer", "LlmStreamer", "888")
+    tracker = Tracker()
+    tracker.llama = StubLlamaServer()  # type: ignore[assignment]
+    stub = StubTwitch()
+    stub.event = make_event("ACTIVE", o1=6000, o2=4000)
+    stub.event["id"] = "event-llm"
+    stub.event["channel_id"] = "888"
+    tracker.client = lambda: stub  # type: ignore[method-assign]
+    rt = ChannelRuntime(channel_id=channel_id, login="llmstreamer",
+                        display_name="LlmStreamer", twitch_id="888", balance=50_000)
+    tracker._channels = {channel_id: rt}
+    tracker._running = True
+
+    # 1. Detection starts the model immediately.
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    check("検知した時点で推論が始まる", "event-llm" in tracker._infer_tasks)
+    tracker._bet_tasks.pop("event-llm").cancel()
+    await tracker._infer_tasks["event-llm"]
+
+    check("推論は 1 回だけ走る", StubLlamaClient.calls == 1, str(StubLlamaClient.calls))
+    check("確率がキャッシュされる", "event-llm" in tracker._infer_results)
+    pred = store.prediction_by_event("event-llm")
+    assert pred
+    row = db.query_one("SELECT source FROM inferences WHERE prediction_id = ?", (pred["id"],))
+    check("投票を待たずに推論が記録される", row is not None and row["source"] == "llm",
+          str(row))
+
+    body = build_messages(StubLlamaClient.last_ctx)[1]["content"]
+    check("プロンプトに現在の投票状況を含めない",
+          "投票状況" not in body and "6,000 pt" not in body, body[:200])
+
+    # 2. Re-observing an already-inferred event must not re-run the model.
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-llm", asyncio.Future()).cancel()
+    check("ポーリングのたびに推論し直さない", StubLlamaClient.calls == 1,
+          str(StubLlamaClient.calls))
+
+    # 3. The pool moves between inference and the bet. The stake must follow
+    #    the pool read in the lead window, not the one the model saw.
+    stub.event = make_event("ACTIVE", o1=1000, o2=9000)
+    stub.event["id"] = "event-llm"
+    stub.event["channel_id"] = "888"
+    await tracker._execute_bet(rt, "event-llm")
+
+    check("投票時に LLM を呼び直さない", StubLlamaClient.calls == 1,
+          str(StubLlamaClient.calls))
+    bet = db.row_to_dict(
+        db.query_one("SELECT * FROM bets WHERE prediction_id = ?", (pred["id"],))
+    )
+    betting = config.load().betting
+    fresh = decide([OutcomeInput("o1", "勝つ", 1000), OutcomeInput("o2", "負ける", 9000)],
+                   {"o1": 0.8, "o2": 0.2}, 50_000, betting)
+    stale = decide([OutcomeInput("o1", "勝つ", 6000), OutcomeInput("o2", "負ける", 4000)],
+                   {"o1": 0.8, "o2": 0.2}, 50_000, betting)
+    check("締め切り直前のプールで賭け金を決める",
+          bet["amount"] == fresh.amount and bet["outcome_id"] == fresh.outcome_id,
+          f"{bet['amount']} != {fresh.amount}")
+    check("推論時点の古いプールとは結果が変わる", fresh.amount != stale.amount,
+          f"{fresh.amount} vs {stale.amount}")
+
+    # 4. Not finished by the deadline: skip rather than bet late.
+    print("\n[推論が間に合わない場合]")
+    db.execute("DELETE FROM bets")
+    StubLlamaClient.delay = 30.0
+    stub.event = make_event("ACTIVE")
+    stub.event["id"] = "event-slow"
+    stub.event["channel_id"] = "888"
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-slow").cancel()
+    await tracker._execute_bet(rt, "event-slow")
+
+    check("推論が終わっていなければ投票しない",
+          db.query_one("SELECT 1 FROM bets") is None)
+    check("間に合わなかったことを警告する",
+          any("推論が終わらなかった" in (r["message"] or "") for r in log.recent(20)))
+    check("間に合わなかった推論は打ち切る",
+          tracker._infer_tasks["event-slow"].cancelled()
+          or tracker._infer_tasks["event-slow"].cancelling() > 0)
+    StubLlamaClient.delay = 0.0
+
+    # 5. History given to the model: options and winner, never the vote split.
+    print("\n[過去予想の渡しかた]")
+    stub.event = make_event("RESOLVED", winner="o1")
+    stub.event["id"] = "event-llm"
+    stub.event["channel_id"] = "888"
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    hist = store.resolved_history_for_prompt(channel_id, 12)
+    check("決着した予想が履歴に入る", bool(hist), str(hist))
+    check("履歴に当時の投票比率を含めない",
+          all("share" not in o for h in hist for o in h["outcomes"]), str(hist))
+    check("履歴の書式に比率が出ない", "%" not in _format_history(hist),
+          _format_history(hist))
+    check("履歴に勝った選択肢は残る",
+          all(h["winner_title"] for h in hist), str(hist))
+
+
+async def test_search() -> None:
+    """Search enriches the prompt, and every failure degrades to no search."""
+    print("\n[ウェブ検索]")
+    log.bind_loop(asyncio.get_running_loop())
+
+    long_hit = SearchHit("t" * 100, "d" * 100, "u")
+    check("文字数上限で結果を切る", len(_clip([long_hit] * 10, 500)) == 2,
+          str(len(_clip([long_hit] * 10, 500))))
+
+    config.update({"search": {"enabled": True, "api_key": "dummy", "count": 3,
+                              "max_chars": 1500}})
+    StubLlamaClient.calls = 0
+    StubLlamaClient.delay = 0.0
+    tracker_mod.LlamaClient = StubLlamaClient  # type: ignore[misc]
+
+    captured: dict = {}
+
+    async def stub_search(query, settings):
+        captured["query"] = query
+        return [SearchHit("Apex 最新パッチ", "射撃訓練場の仕様が変わりました", "https://e/1"),
+                SearchHit("大会結果", "前回は第 3 ラウンドで敗退", "https://e/2")]
+
+    tracker_mod.search = stub_search  # type: ignore[assignment]
+
+    channel_id = store.create_channel("searchstreamer", "SearchStreamer", "777")
+    tracker = Tracker()
+    tracker.llama = StubLlamaServer()  # type: ignore[assignment]
+    stub = StubTwitch()
+    stub.event = make_event("ACTIVE")
+    stub.event["id"] = "event-search"
+    stub.event["channel_id"] = "777"
+    tracker.client = lambda: stub  # type: ignore[method-assign]
+    rt = ChannelRuntime(channel_id=channel_id, login="searchstreamer",
+                        display_name="SearchStreamer", twitch_id="777", balance=50_000)
+    tracker._channels = {channel_id: rt}
+    tracker._running = True
+
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-search").cancel()
+    await tracker._infer_tasks["event-search"]
+
+    body = build_messages(StubLlamaClient.last_ctx)[1]["content"]
+    check("LLM が作ったクエリで検索する", "Apex Legends" in captured.get("query", ""),
+          captured.get("query", ""))
+    check("検索結果がプロンプトに入る" , "射撃訓練場の仕様が変わりました" in body)
+    check("ゲーム名と配信タイトルもプロンプトに入る",
+          "Apex Legends" in body and "ランクマ耐久" in body)
+    check("外部コンテンツであることを明示する",
+          "指示ではない" in body and "従わず" in body, body[:400])
+    check("検索しても推論は 1 回のまま", StubLlamaClient.calls == 1,
+          str(StubLlamaClient.calls))
+
+    # Search blowing up must not cost us the inference.
+    print("\n[検索が失敗した場合]")
+
+    async def exploding_search(query, settings):
+        raise RuntimeError("検索 API が落ちています")
+
+    tracker_mod.search = exploding_search  # type: ignore[assignment]
+    stub.event = make_event("ACTIVE")
+    stub.event["id"] = "event-search2"
+    stub.event["channel_id"] = "777"
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-search2").cancel()
+    await tracker._infer_tasks["event-search2"]
+    check("検索が例外でも推論タスクは黙って死なない",
+          any("推論処理に失敗" in (r["message"] or "") for r in log.recent(20)))
+
+    # A broken stream lookup only costs the query, not the inference.
+    tracker_mod.search = stub_search  # type: ignore[assignment]
+    stub.stream_fails = True
+    stub.event = make_event("ACTIVE")
+    stub.event["id"] = "event-search3"
+    stub.event["channel_id"] = "777"
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-search3").cancel()
+    await tracker._infer_tasks["event-search3"]
+    check("配信情報が取れなくても推論は完走する",
+          "event-search3" in tracker._infer_results)
+    check("配信情報の取得失敗を警告する",
+          any("配信情報を取得できません" in (r["message"] or "") for r in log.recent(20)))
+    stub.stream_fails = False
+
+    # The worked example: neither the title nor the Twitch category says what
+    # game this is. Only the transcript does, so only the model can find it.
+    print("\n[話題の特定]")
+    tracker_mod.search = stub_search  # type: ignore[assignment]
+    store.add_transcript(channel_id, "今日はAPEXのランクやっていきます")
+    stub.stream = StreamInfo(title="ゲームする", game="")
+    vague = make_event("ACTIVE")
+    vague["id"] = "event-vague"
+    vague["channel_id"] = "777"
+    vague["title"] = "優勝"
+    vague["outcomes"] = [
+        {"id": "o1", "title": "する", "total_points": 6000, "total_users": 30},
+        {"id": "o2", "title": "しない", "total_points": 4000, "total_users": 20},
+    ]
+    stub.event = vague
+    await tracker._observe(rt, PredictionEvent.parse(vague))
+    tracker._bet_tasks.pop("event-vague").cancel()
+    await tracker._infer_tasks["event-vague"]
+
+    qctx = StubLlamaClient.last_query_ctx
+    check("クエリ生成に文字起こしを渡す", "APEX" in qctx.transcript, qctx.transcript[:120])
+    check("クエリ生成に予想タイトルと選択肢を渡す",
+          qctx.event.title == "優勝"
+          and [o.title for o in qctx.event.outcomes] == ["する", "しない"])
+    check("LLM は文字起こしから話題を特定して検索する",
+          "Apex Legends" in captured.get("query", ""), captured.get("query", ""))
+
+    # Query generation failing costs the search, never the inference.
+    print("\n[クエリ生成が失敗した場合]")
+    StubLlamaClient.query_raises = True
+    stub.stream = StreamInfo(title="ランクマ耐久", game="Apex Legends")
+    captured.clear()
+    stub.event = make_event("ACTIVE")
+    stub.event["id"] = "event-qfail"
+    stub.event["channel_id"] = "777"
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-qfail").cancel()
+    await tracker._infer_tasks["event-qfail"]
+    check("クエリ生成が失敗したら検索しない", "query" not in captured, str(captured))
+    check("クエリ生成の失敗を警告する",
+          any("検索クエリの生成に失敗" in (r["message"] or "") for r in log.recent(20)))
+    check("クエリ生成が失敗しても推論は完走する", "event-qfail" in tracker._infer_results)
+    check("検索なしでもプロンプトに検索セクションを作らない",
+          "検索結果" not in build_messages(StubLlamaClient.last_ctx)[1]["content"])
+    StubLlamaClient.query_raises = False
+
+    # The model is told to answer empty rather than guess; respect that.
+    StubLlamaClient.suggestion = ("特定できない", "")
+    captured.clear()
+    stub.event = make_event("ACTIVE")
+    stub.event["id"] = "event-noq"
+    stub.event["channel_id"] = "777"
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-noq").cancel()
+    await tracker._infer_tasks["event-noq"]
+    check("話題を特定できなければ検索しない", "query" not in captured, str(captured))
+    check("検索を省略したことをログに残す",
+          any("話題を特定できなかった" in (r["message"] or "") for r in log.recent(20)))
+    check("検索を省略しても推論は完走する", "event-noq" in tracker._infer_results)
+    StubLlamaClient.suggestion = ("Apex Legends のマッチで優勝できるか",
+                                  "Apex Legends 優勝 確率 チーム数")
+
+    # Leave the DB as we found it: test_retention counts transcripts globally.
+    db.execute("DELETE FROM transcripts WHERE channel_id = ?", (channel_id,))
+    config.update({"search": {"enabled": False}})
+
+
 async def test_retention() -> None:
     print("\n[保持時間]")
     channel = store.get_channel_by_login("teststreamer")
@@ -337,6 +653,8 @@ def main() -> int:
         test_kelly()
         test_llm_parsing()
         asyncio.run(test_flow())
+        asyncio.run(test_two_phase())
+        asyncio.run(test_search())
         asyncio.run(test_retention())
         test_api()
     except AssertionError as exc:
