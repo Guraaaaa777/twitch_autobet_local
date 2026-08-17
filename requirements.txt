@@ -1,0 +1,7 @@
+# Verified on Python 3.14 / Windows 11.
+fastapi>=0.141
+uvicorn[standard]>=0.52
+httpx>=0.28
+websockets>=17
+faster-whisper>=1.2
+streamlink>=8.5

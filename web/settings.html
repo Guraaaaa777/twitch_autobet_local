@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>設定 - twitch_autobet</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>twitch_autobet</h1>
+  <nav>
+    <a href="/" data-page="main">メイン</a>
+    <a href="/settings" data-page="settings">設定</a>
+  </nav>
+  <span class="spacer"></span>
+  <span id="dirty" class="small muted"></span>
+  <button id="btn-reload">再読込</button>
+  <button id="btn-save" class="primary">保存</button>
+</header>
+
+<main>
+  <div id="sections"></div>
+
+  <section>
+    <h2>接続テスト</h2>
+    <div class="body">
+      <div class="row">
+        <label class="small">Twitch 接続テスト対象のチャンネル名</label>
+        <input type="text" id="test-login" class="mono" placeholder="shroud" style="width:220px">
+        <button id="btn-test-twitch">Twitch を検証</button>
+        <button id="btn-test-llama">llama.cpp 設定を検証</button>
+      </div>
+      <div class="small muted" style="margin-top:8px">
+        Twitch の非公開 API はスキーマが予告なく変わります。追跡が動かないときはまずここで、
+        どのクエリが失敗しているかを確認してください。
+      </div>
+      <pre class="result" id="test-result" style="display:none"></pre>
+    </div>
+  </section>
+</main>
+
+<div id="toasts"></div>
+
+<script type="module" src="/static/settings.js"></script>
+</body>
+</html>

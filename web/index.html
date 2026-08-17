@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>twitch_autobet</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>twitch_autobet</h1>
+  <nav>
+    <a href="/" data-page="main">メイン</a>
+    <a href="/settings" data-page="settings">設定</a>
+  </nav>
+  <span class="spacer"></span>
+  <span id="statusbar" class="row small"></span>
+  <button id="btn-start" class="primary">追跡開始</button>
+  <button id="btn-stop">追跡停止</button>
+</header>
+
+<main>
+
+  <section>
+    <h2>登録</h2>
+    <div class="body">
+      <form id="form-register" class="row">
+        <input id="input-login" type="text" placeholder="チャンネル名 (表示名ではなく URL の名前)"
+               style="flex:1;max-width:420px" autocomplete="off" required>
+        <button type="submit" class="primary">登録</button>
+      </form>
+      <div class="small muted" style="margin-top:6px">
+        例: twitch.tv/<span class="mono">shroud</span> なら <span class="mono">shroud</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>登録チャンネル一覧</h2>
+    <table id="table-channels">
+      <thead>
+        <tr>
+          <th>チャンネル名</th>
+          <th>表示名</th>
+          <th style="text-align:right">保有ポイント</th>
+          <th>追跡</th>
+          <th>固定確率</th>
+          <th>情報付加</th>
+          <th>状態</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div id="channels-empty" class="empty">登録されたチャンネルはありません</div>
+  </section>
+
+  <section>
+    <h2>
+      チャンネルポイント推移
+      <select id="chart-channel" class="small"></select>
+      <span id="chart-summary" class="small muted"></span>
+    </h2>
+    <div class="body">
+      <svg id="chart" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>
+      ログ
+      <span class="spacer"></span>
+      <span id="log-filters" class="row small"></span>
+      <label class="small"><input type="checkbox" id="log-follow" checked> 自動追従</label>
+      <button class="small" id="btn-clear-log">消去</button>
+    </h2>
+    <div id="log"></div>
+  </section>
+
+</main>
+
+<dialog id="dlg-fixed">
+  <h3>固定確率設定</h3>
+  <div class="body">
+    <p class="small muted" id="fixed-target"></p>
+    <label class="row small">
+      <input type="checkbox" id="fixed-enabled"> 固定確率を有効にする (有効時は LLM 推論を行いません)
+    </label>
+    <div style="margin-top:12px">
+      <label class="small">選択肢ごとの確率 (カンマ区切り / 上から順)</label>
+      <input type="text" id="fixed-probs" class="mono" style="width:100%" placeholder="0.6, 0.4">
+      <div class="small muted" style="margin-top:6px">
+        合計が 1 でなくても自動で正規化されます。<br>
+        値の個数が予想の選択肢数と一致しないときは、その予想だけ LLM 推論に切り替わります。
+      </div>
+    </div>
+  </div>
+  <div class="foot">
+    <button data-close>キャンセル</button>
+    <button class="primary" id="fixed-save">保存</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-manual">
+  <h3>手動情報付加</h3>
+  <div class="body">
+    <p class="small muted" id="manual-target"></p>
+    <label class="small">投票の概要が事前にわかる場合、その内容を入力します。LLM のプロンプトに含まれます。</label>
+    <textarea id="manual-text" rows="7" placeholder="例: 今日は新キャラの初見プレイ。勝率は普段より低め。"></textarea>
+  </div>
+  <div class="foot">
+    <button data-close>キャンセル</button>
+    <button class="primary" id="manual-save">保存</button>
+  </div>
+</dialog>
+
+<div id="toasts"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
