@@ -9,6 +9,16 @@ const SECTIONS = [
   {
     title: 'llama.cpp 設定',
     fields: [
+      { path: 'llama.mode', label: 'LLM の使用', type: 'select',
+        options: [
+          { value: 'auto', label: '自動 (固定確率だけのときは起動しない)' },
+          { value: 'always', label: '常に使う' },
+          { value: 'never', label: '使わない' },
+        ],
+        hint: 'llama.cpp はモデルと KV キャッシュを起動時に確保するので、推論していなくても'
+          + 'メモリを占有し続けます。全チャンネルを固定確率で運用するなら「使わない」にすると'
+          + '起動しません (文字起こしも連動して止まります)。'
+          + '「常に使う」は、固定確率の項目数が選択肢数と合わない予想を LLM に回したい場合に選びます' },
       { path: 'llama.server_path', label: 'llama-server 実行ファイル', type: 'text',
         hint: '例: C:\\llama.cpp\\llama-server.exe' },
       { path: 'llama.model_path', label: 'モデル (GGUF)', type: 'text',
@@ -179,11 +189,17 @@ function buildForm() {
         input = el('input', { type: 'checkbox', id: field.path });
         input.checked = Boolean(value);
       } else if (field.type === 'select') {
+        // Options are bare strings when the stored value reads well enough on
+        // its own, or {value, label} when it does not.
         input = el('select', { id: field.path });
+        const optionValue = (o) => (typeof o === 'string' ? o : o.value);
         for (const option of field.options) {
-          input.append(el('option', { value: option, text: option }));
+          input.append(el('option', {
+            value: optionValue(option),
+            text: typeof option === 'string' ? option : option.label,
+          }));
         }
-        input.value = String(value ?? field.options[0]);
+        input.value = String(value ?? optionValue(field.options[0]));
       } else {
         input = el('input', {
           type: field.type === 'password' ? 'password' : field.type,

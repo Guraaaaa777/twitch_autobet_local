@@ -334,6 +334,7 @@ async def test_two_phase() -> None:
                         display_name="LlmStreamer", twitch_id="888", balance=50_000)
     tracker._channels = {channel_id: rt}
     tracker._running = True
+    tracker._llm_enabled = True  # normally set by start(); these drive it directly
 
     # 1. Detection starts the model immediately.
     await tracker._observe(rt, PredictionEvent.parse(stub.event))
@@ -454,6 +455,7 @@ async def test_search() -> None:
                         display_name="SearchStreamer", twitch_id="777", balance=50_000)
     tracker._channels = {channel_id: rt}
     tracker._running = True
+    tracker._llm_enabled = True
 
     await tracker._observe(rt, PredictionEvent.parse(stub.event))
     tracker._bet_tasks.pop("event-search").cancel()
@@ -568,6 +570,65 @@ async def test_search() -> None:
     config.update({"search": {"enabled": False}})
 
 
+async def test_llm_mode() -> None:
+    """LLM の使用 switch: whether llama-server is launched at all."""
+    print("\n[LLM の使用切り替え]")
+    log.bind_loop(asyncio.get_running_loop())
+
+    fixed = {"fixed_probs": {"enabled": True, "probs": [0.8, 0.2]}}
+    plain: dict = {"fixed_probs": None}
+
+    check("自動: 固定確率だけなら起動しない",
+          tracker_mod.llm_required("auto", [fixed]) is False)
+    check("自動: 固定確率のないチャンネルがあれば起動する",
+          tracker_mod.llm_required("auto", [fixed, plain]) is True)
+    check("使わない: 固定確率がなくても起動しない",
+          tracker_mod.llm_required("never", [plain]) is False)
+    check("常に使う: 固定確率だけでも起動する",
+          tracker_mod.llm_required("always", [fixed]) is True)
+
+    # The gap the switch had to close: fixed probabilities fall back to the
+    # model when the outcome count does not match, and with no model this
+    # session that has to be said out loud, not surface as a missing inference
+    # five seconds before the lock.
+    channel_id = store.create_channel("fixedstreamer", "FixedStreamer", "666")
+    store.update_channel(channel_id, fixed_probs={"enabled": True, "probs": [0.8, 0.2]})
+
+    tracker = Tracker()
+    stub = StubTwitch()
+    stub.event = make_event("ACTIVE")
+    stub.event["outcomes"].append(
+        {"id": "o3", "title": "引き分け", "color": "BLUE",
+         "total_points": 1000, "total_users": 5}
+    )
+    stub.event["id"] = "event-mismatch"
+    stub.event["channel_id"] = "666"
+    tracker.client = lambda: stub  # type: ignore[method-assign]
+    rt = ChannelRuntime(channel_id=channel_id, login="fixedstreamer",
+                        display_name="FixedStreamer", twitch_id="666", balance=50_000)
+    tracker._channels = {channel_id: rt}
+    tracker._running = True
+    tracker._llm_enabled = False
+
+    await tracker._observe(rt, PredictionEvent.parse(stub.event))
+    tracker._bet_tasks.pop("event-mismatch", asyncio.Future()).cancel()
+    check("LLM 無効なら推論タスクを作らない",
+          "event-mismatch" not in tracker._infer_tasks)
+    check("項目数不一致を検知時に警告する",
+          any("見送ります" in (r["message"] or "") for r in log.recent(20)))
+
+    await tracker._execute_bet(rt, "event-mismatch")
+    check("項目数が合わなければ投票しない",
+          db.query_one("SELECT 1 FROM bets WHERE prediction_id = "
+                       "(SELECT id FROM predictions WHERE event_id = 'event-mismatch')")
+          is None)
+    check("llama-server 未起動をエラーにはしない",
+          not any("llama-server が起動していない" in (r["message"] or "")
+                  for r in log.recent(20)))
+
+    db.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
+
+
 async def test_retention() -> None:
     print("\n[保持時間]")
     channel = store.get_channel_by_login("teststreamer")
@@ -602,6 +663,19 @@ def test_api() -> None:
 
         res = client.put("/api/settings", json={"poll_rate_sec": -1})
         check("不正な設定を拒否する", res.status_code == 400, res.text[:200])
+
+        res = client.put("/api/settings", json={"llama": {"mode": "sometimes"}})
+        check("未知の LLM モードを拒否する", res.status_code == 400, res.text[:200])
+
+        client.put("/api/settings", json={"llama": {"mode": "never"}})
+        res = client.post("/api/settings/test/llama")
+        body = res.json()
+        check("使わない設定なら llama のパス未設定を失敗にしない",
+              res.status_code == 200 and body["ok"] and not body["command"],
+              res.text[:200])
+        check("起動しないことを検証結果で伝える", "起動しません" in body.get("note", ""),
+              res.text[:200])
+        client.put("/api/settings", json={"llama": {"mode": "auto"}})
 
         res = client.get("/api/channels")
         check("チャンネル一覧を取得できる", res.status_code == 200
@@ -667,6 +741,7 @@ def main() -> int:
         asyncio.run(test_flow())
         asyncio.run(test_two_phase())
         asyncio.run(test_search())
+        asyncio.run(test_llm_mode())
         asyncio.run(test_retention())
         test_api()
     except AssertionError as exc:

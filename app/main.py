@@ -258,8 +258,21 @@ async def test_twitch(body: LoginBody) -> dict[str, Any]:
 async def test_llama() -> dict[str, Any]:
     settings = config.load().llama
     problems = tracker.llama.validate(settings)
+    if settings.mode == "never":
+        # Nothing will be launched, so unset paths are not a misconfiguration.
+        # Still report them, so switching the mode back is not a surprise.
+        return {
+            "ok": True,
+            "mode": settings.mode,
+            "problems": [],
+            "note": "LLM の使用が「使わない」のため llama-server は起動しません"
+                    + (f" (未解決の設定: {'; '.join(problems)})" if problems else ""),
+            "command": [],
+            "server": tracker.llama.status,
+        }
     return {
         "ok": not problems,
+        "mode": settings.mode,
         "problems": problems,
         "command": tracker.llama.build_args(settings) if not problems else [],
         "server": tracker.llama.status,

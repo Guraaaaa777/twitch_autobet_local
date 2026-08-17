@@ -16,10 +16,27 @@ from pydantic import BaseModel, Field
 from .paths import SETTINGS_FILE, ensure_dirs
 
 CacheType = Literal["f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"]
+LlmMode = Literal["auto", "always", "never"]
 
 
 class LlamaSettings(BaseModel):
     """llama.cpp (llama-server) launch configuration."""
+
+    mode: LlmMode = "auto"
+    """Whether llama-server is launched at all.
+
+    llama.cpp allocates the weights and the whole KV cache up front, so an idle
+    server costs the same RAM as a busy one -- with the defaults here (16k
+    context, f16 cache) that is the GGUF's size plus a couple of gigabytes,
+    held for as long as tracking runs. When every channel bets on fixed
+    probabilities there is nothing for it to do, hence "never".
+
+    "auto" decides per session: start it only if some tracked channel has no
+    fixed probabilities. "always" starts it regardless, which is what makes the
+    per-prediction fallback reach a model -- fixed probabilities only apply to
+    predictions whose outcome count matches, and under "auto" a channel that
+    has them will not have started a server for the ones that do not match.
+    """
 
     server_path: str = ""
     """Absolute path to llama-server.exe. Required before tracking can start."""

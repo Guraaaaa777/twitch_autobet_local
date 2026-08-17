@@ -72,6 +72,7 @@ class Tracker:
         self._running = False
         self._started_at: str | None = None
         self._last_error: str | None = None
+        self._llm_enabled = False
         self._channels: dict[int, ChannelRuntime] = {}
         self._bet_tasks: dict[str, asyncio.Task] = {}
         self._bet_guard: set[str] = set()
@@ -94,6 +95,10 @@ class Tracker:
             "started_at": self._started_at,
             "last_error": self._last_error,
             "dry_run": config.load().betting.dry_run,
+            "llm": {
+                "mode": config.load().llama.mode,
+                "enabled": self._llm_enabled,
+            },
             "llama": self.llama.status,
             "pubsub": self._pubsub.status if self._pubsub else {"connected": False},
             "transcription": self.transcription.status(),
@@ -138,7 +143,8 @@ class Tracker:
             if not channels:
                 raise RuntimeError("追跡が有効なチャンネルがありません")
 
-            needs_llm = any(not _fixed_probs_enabled(c) for c in channels)
+            needs_llm = llm_required(settings.llama.mode, channels)
+            self._llm_enabled = needs_llm
             if needs_llm:
                 problems = self.llama.validate(settings.llama)
                 if problems:
@@ -173,12 +179,23 @@ class Tracker:
                 )
                 await self._pubsub.start()
 
+            # The transcript exists to feed the prompt. With no model to feed it
+            # is a streamlink + ffmpeg + Whisper pipeline per channel producing
+            # rows nothing reads -- and on CPU that costs far more than the
+            # llama-server we just declined to start.
+            transcription = settings.transcription
+            if not needs_llm and transcription.enabled:
+                transcription = transcription.model_copy(update={"enabled": False})
+                log.info(
+                    log.CAT_TRANSCRIPT,
+                    "LLM を使わない設定のため、文字起こしも起動しません",
+                )
             await self.transcription.sync(
                 [
                     {"id": rt.channel_id, "login": rt.login}
                     for rt in self._channels.values()
                 ],
-                settings.transcription,
+                transcription,
             )
 
             self._housekeeping = asyncio.create_task(self._housekeep(), name="housekeeping")
@@ -191,6 +208,8 @@ class Tracker:
                     "channels": [rt.login for rt in self._channels.values()],
                     "dry_run": settings.betting.dry_run,
                     "llm": needs_llm,
+                    "llm_mode": settings.llama.mode,
+                    "transcription": transcription.enabled,
                 },
             )
             log.notify("tracking", running=True)
@@ -200,6 +219,7 @@ class Tracker:
             if not self._running:
                 return
             self._running = False
+            self._llm_enabled = False
 
             for tasks in (self._bet_tasks, self._infer_tasks):
                 for event_id, task in list(tasks.items()):
@@ -382,13 +402,36 @@ class Tracker:
         if _fixed_probs_enabled(channel):
             if _fixed_probs_usable(channel, event):
                 return  # resolved at bet time; no model involved
+            mismatch = (
+                f"固定確率の項目数 ({len(channel['fixed_probs'].get('probs') or [])}) が"
+                f"選択肢数 ({len(event.outcomes)}) と一致しません"
+            )
+            if not self._llm_enabled:
+                # Fixed probabilities are meant to fall back to the model here,
+                # but there is no model this session. Say so now rather than
+                # letting it surface as a missing inference at bet time.
+                log.warn(
+                    log.CAT_INFERENCE,
+                    f"{mismatch}。LLM も使わない設定のためこの予想は見送ります"
+                    "（設定 → LLM の使用 を「常に使う」にすると推論に切り替わります）",
+                    channel=rt.login,
+                    detail={"event_id": event_id, "llm_mode": config.load().llama.mode},
+                )
+                return
             log.warn(
                 log.CAT_INFERENCE,
-                f"固定確率の項目数 ({len(channel['fixed_probs'].get('probs') or [])}) が"
-                f"選択肢数 ({len(event.outcomes)}) と一致しないため LLM 推論に切り替えます",
+                f"{mismatch}ため LLM 推論に切り替えます",
                 channel=rt.login,
                 detail={"event_id": event_id},
             )
+        elif not self._llm_enabled:
+            log.warn(
+                log.CAT_INFERENCE,
+                "LLM を使わない設定で、固定確率も未設定のためこの予想は見送ります",
+                channel=rt.login,
+                detail={"event_id": event_id, "llm_mode": config.load().llama.mode},
+            )
+            return
 
         if not self.llama.running:
             log.error(
@@ -752,6 +795,10 @@ class Tracker:
         if cached is not None:
             return cached[0]
 
+        if not self._llm_enabled:
+            # `_schedule_inference` already explained why, at detection time.
+            return None
+
         task = self._infer_tasks.get(event.event_id)
         if task is not None and not task.done():
             task.cancel()
@@ -853,6 +900,19 @@ class Tracker:
             except Exception as exc:  # noqa: BLE001
                 log.error("メンテナンス処理に失敗しました", exc=exc)
             await asyncio.sleep(60.0)
+
+
+def llm_required(mode: str, channels: list[dict]) -> bool:
+    """Whether this session needs llama-server at all.
+
+    Decided once, at start: the answer gates a process launch, and channels
+    cannot be added to a running tracker anyway.
+    """
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return any(not _fixed_probs_enabled(c) for c in channels)
 
 
 def _fixed_probs_enabled(channel: dict) -> bool:

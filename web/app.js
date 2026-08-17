@@ -85,8 +85,14 @@ function renderStatusBar() {
   bar.append(el('span', { class: `badge ${s.dry_run ? 'warn' : 'err'}`,
     text: s.dry_run ? 'ドライラン' : '実投票' }));
   if (s.running) {
-    bar.append(el('span', { class: `badge ${s.llama?.ready ? 'on' : 'off'}`,
-      text: `llama.cpp ${s.llama?.ready ? '稼働' : '停止'}` }));
+    if (s.llm && s.llm.enabled === false) {
+      // Not a failure: it was never started. Saying "停止" here reads like one.
+      bar.append(el('span', { class: 'badge off',
+        title: `LLM の使用: ${s.llm.mode}`, text: 'LLM 未使用' }));
+    } else {
+      bar.append(el('span', { class: `badge ${s.llama?.ready ? 'on' : 'off'}`,
+        text: `llama.cpp ${s.llama?.ready ? '稼働' : '停止'}` }));
+    }
     bar.append(el('span', { class: `badge ${s.pubsub?.connected ? 'on' : 'off'}`,
       text: `PubSub ${s.pubsub?.connected ? '接続' : '未接続'}` }));
     const tr = s.transcription || {};
